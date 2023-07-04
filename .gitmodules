@@ -3,4 +3,4 @@
 	url = https://github.com/protobuf-c/protobuf-c.git
 [submodule "esp_hosted_ng/esp/esp_driver/esp-idf"]
 	path = esp_hosted_ng/esp/esp_driver/esp-idf
-	url = https://github.com/espressif/esp-idf.git
+	url = https://github.com/jcmvbkbc/esp-idf.git
