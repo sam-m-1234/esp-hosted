@@ -252,6 +252,7 @@ static bool esp_shmem_hw_queue_read(void)
 				free(copy);
 				break;
 			}
+			xSemaphoreGive(read_semaphore);
 		}
 		hw_q->read = ++r;
 		ESP_LOGD(TAG, "%s: read_queue->read = %d write = %d", __func__, r, w);
@@ -262,9 +263,7 @@ static bool esp_shmem_hw_queue_read(void)
 static void esp_shmem_hw_queue_task(void *p)
 {
 	for (;;) {
-		if (esp_shmem_hw_queue_read())
-			xSemaphoreGive(read_semaphore);
-		else
+		if (!esp_shmem_hw_queue_read())
 			xSemaphoreTake(hw_queue_read_semaphore, portMAX_DELAY);
 	}
 }
@@ -280,8 +279,6 @@ static int esp_shmem_read(interface_handle_t *if_handle, interface_buffer_handle
 	}
 
 	while (1) {
-		esp_shmem_hw_queue_read();
-
 		if (uxQueueMessagesWaiting(shmem_rx_queue[PRIO_Q_HIGH])) {
 			ret = xQueueReceive(shmem_rx_queue[PRIO_Q_HIGH], buf_handle, portMAX_DELAY);
 			break;
