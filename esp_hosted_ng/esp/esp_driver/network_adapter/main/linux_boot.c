@@ -39,6 +39,17 @@ static void cache_partition(const char *name)
 		abort();
 }
 
+static void map_psram_to_iram(void)
+{
+	uint32_t *dst = (uint32_t *)DR_REG_MMU_TABLE + 0x100;
+	uint32_t *src = (uint32_t *)DR_REG_MMU_TABLE + 0x180;
+	int i;
+
+	for (i = 0; i < 0x80; ++i) {
+		dst[i] = src[i];
+	}
+}
+
 static void IRAM_ATTR map_flash_and_go(void)
 {
 	const void *ptr0, *ptr;
@@ -48,6 +59,8 @@ static void IRAM_ATTR map_flash_and_go(void)
 
 	ptr = map_partition("rootfs");
 	printf("ptr = %p\n", ptr);
+
+	map_psram_to_iram();
 
 	cache_partition("nvs");
 
