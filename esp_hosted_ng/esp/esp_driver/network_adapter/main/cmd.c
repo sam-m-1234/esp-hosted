@@ -657,6 +657,7 @@ esp_err_t initialise_wifi(void)
 {
 	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
 
+	cfg.nvs_enable = 0;
 	esp_err_t result = esp_wifi_init(&cfg);
 	if (result != ESP_OK) {
 		ESP_LOGE(TAG,"Init internal failed");
