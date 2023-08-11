@@ -19,7 +19,6 @@
 #include <unistd.h>
 #include <rom/rtc.h>
 #include "esp.h"
-#include "esp_intr_alloc.h"
 #include "esp_log.h"
 #include "interface.h"
 #include "endian.h"
@@ -27,124 +26,26 @@
 #include "freertos/task.h"
 #include "soc/periph_defs.h"
 #include "stats.h"
+#include "linux_ipc.h"
 
 static const char TAG[] = "FW_SHMEM";
 
-#define QUEUE_SIZE 64
-
-typedef uint32_t u32;
-
-struct esp_wifi_shmem_queue
-{
-	volatile u32 write;
-	volatile u32 read;
-	u32 offset;
-	u32 mask;
-};
-
-#define ESP_SHMEM_READ_HW_Q		1
-#define ESP_SHMEM_WRITE_HW_Q		0
-
-#define ESP_SHMEM_IRQ_FROM_HOST_REG	(4 * CONFIG_ESP_SHMEM_IRQ_FROM_HOST_IDX)
-#define ESP_SHMEM_IRQ_TO_HOST_REG	(4 * CONFIG_ESP_SHMEM_IRQ_TO_HOST_IDX)
-
-static struct esp_wifi_shmem_queue hw_queue[2];
-static void *queue_data[2][QUEUE_SIZE];
-
-static u32 tx_postprocessed;
-
-#define SPI_RX_QUEUE_SIZE      20
-#define SPI_TX_QUEUE_SIZE      20
+#define ESP_IPC_WIFI_ADDR	1
+#define ESP_WIFI_RX_QUEUE_SIZE	20
 
 static interface_context_t context;
 static interface_handle_t if_handle_g;
 
-static SemaphoreHandle_t hw_queue_read_semaphore;
 static SemaphoreHandle_t read_semaphore;
 static QueueHandle_t shmem_rx_queue[MAX_PRIORITY_QUEUES];
-static QueueHandle_t shmem_tx_queue[MAX_PRIORITY_QUEUES];
-static QueueHandle_t shmem_tx_postprocess_queue;
-
-static void esp_shmem_write_irq(u32 reg, u32 v)
-{
-	*(volatile u32*)(0x600c0030 + reg) = v;
-}
-
-static void esp_shmem_buffer_done(void *p)
-{
-	ESP_LOGD(TAG, "%s", __func__);
-	free(p);
-}
-
-static void esp_shmem_hw_queue_write(u32 irq)
-{
-	struct esp_wifi_shmem_queue *hw_q = hw_queue + ESP_SHMEM_WRITE_HW_Q;
-	void * volatile *data = (void *)hw_queue + hw_q->offset;
-	bool changed = false;
-
-	for (;;) {
-		interface_buffer_handle_t buf_handle;
-		u32 r = hw_q->read;
-		u32 w = hw_q->write;
-		u32 p = tx_postprocessed;
-		BaseType_t ret;
-
-		while (p != r) {
-			ret = xQueueReceive(shmem_tx_postprocess_queue, &buf_handle, 0);
-
-			if (!ret) {
-				ESP_LOGE(TAG, "%s: xQueueReceive failed for postprocessing queue", __func__);
-				break;
-			}
-			if (buf_handle.priv_buffer_handle &&
-			    buf_handle.free_buf_handle)
-				buf_handle.free_buf_handle(buf_handle.priv_buffer_handle);
-			++p;
-		}
-		tx_postprocessed = p;
-
-		if (w - r == hw_q->mask)
-			break;
-
-		if (uxQueueMessagesWaiting(shmem_tx_queue[PRIO_Q_HIGH]))
-			ret = xQueueReceive(shmem_tx_queue[PRIO_Q_HIGH], &buf_handle, portMAX_DELAY);
-		else if (uxQueueMessagesWaiting(shmem_tx_queue[PRIO_Q_MID]))
-			ret = xQueueReceive(shmem_tx_queue[PRIO_Q_MID], &buf_handle, portMAX_DELAY);
-		else if (uxQueueMessagesWaiting(shmem_tx_queue[PRIO_Q_LOW]))
-			ret = xQueueReceive(shmem_tx_queue[PRIO_Q_LOW], &buf_handle, portMAX_DELAY);
-		else
-			break;
-
-		if (!ret) {
-			ESP_LOGE(TAG, "%s: xQueueReceive failed for tx queue", __func__);
-			break;
-		}
-
-		data[w & hw_q->mask] = buf_handle.payload;
-		hw_q->write = ++w;
-		changed = true;
-		ESP_LOGD(TAG, "%s: write_queue->write = %d", __func__, w);
-
-		ret = xQueueSend(shmem_tx_postprocess_queue, &buf_handle, 0);
-		if (!ret) {
-			ESP_LOGE(TAG, "%s: xQueueSend failed", __func__);
-			break;
-		}
-	}
-
-	if (changed)
-		esp_shmem_write_irq(ESP_SHMEM_IRQ_TO_HOST_REG, irq);
-}
 
 static int32_t esp_shmem_write(interface_handle_t *handle, interface_buffer_handle_t *buf_handle)
 {
-	esp_err_t ret = ESP_OK;
 	int32_t total_len = 0;
 	uint16_t offset = 0;
 	struct esp_payload_header *header = NULL;
-	interface_buffer_handle_t tx_buf_handle = {
-		.free_buf_handle = esp_shmem_buffer_done,
-	};
+	uint8_t *payload;
+	uint32_t priority;
 
 	ESP_LOGD(TAG, "%s", __func__);
 	if (!handle || !buf_handle) {
@@ -169,8 +70,7 @@ static int32_t esp_shmem_write(interface_handle_t *handle, interface_buffer_hand
 		ESP_LOGE(TAG, "couldn't allocate packet copy\n");
 		return ESP_FAIL;
 	}
-	tx_buf_handle.payload = (uint8_t *)header;
-	tx_buf_handle.priv_buffer_handle = header,
+	payload = (uint8_t *)header;
 
 	offset = sizeof(struct esp_payload_header);
 	/* Initialize header */
@@ -184,44 +84,39 @@ static int32_t esp_shmem_write(interface_handle_t *handle, interface_buffer_hand
 	};
 
 	/* copy the data from caller */
-	memcpy(tx_buf_handle.payload + offset, buf_handle->payload, buf_handle->payload_len);
+	memcpy(payload + offset, buf_handle->payload, buf_handle->payload_len);
 
 	if (header->if_type == ESP_INTERNAL_IF)
-		ret = xQueueSend(shmem_tx_queue[PRIO_Q_HIGH], &tx_buf_handle, portMAX_DELAY);
+		priority = PRIO_Q_HIGH;
 	else if (header->if_type == ESP_HCI_IF)
-		ret = xQueueSend(shmem_tx_queue[PRIO_Q_MID], &tx_buf_handle, portMAX_DELAY);
+		priority = PRIO_Q_MID;
 	else
-		ret = xQueueSend(shmem_tx_queue[PRIO_Q_LOW], &tx_buf_handle, portMAX_DELAY);
+		priority = PRIO_Q_LOW;
 
-	if (ret != pdTRUE) {
+	if (esp_ipc_tx(ESP_IPC_WIFI_ADDR, priority, payload) != ESP_OK) {
 		free(header);
 		return ESP_FAIL;
 	}
 
-	esp_shmem_hw_queue_write(1);
-
 	return buf_handle->payload_len;
 }
 
-static bool esp_shmem_hw_queue_read(void)
+static void esp_shmem_buffer_done(void *p)
 {
-	struct esp_wifi_shmem_queue *hw_q = hw_queue + ESP_SHMEM_READ_HW_Q;
-	void * volatile *data = (void *)hw_queue + hw_q->offset;
-	u32 r, w;
+	ESP_LOGD(TAG, "%s", __func__);
+	free(p);
+}
 
-	r = hw_q->read;
-	w = hw_q->write;
+static void esp_shmem_rx(void *p, void *data)
+{
+	struct esp_payload_header *header = data;
 
-	if (r == w)
-		return false;
-
-	while (r != w) {
-		struct esp_payload_header *header = NULL;
-		uint16_t len = 0, offset = 0;
-
-		header = data[r & hw_q->mask];
-		len = le16toh(header->len);
-		offset = le16toh(header->offset);
+	if (!header) {
+		uint8_t get_capabilities(void);
+		send_bootup_event_to_host(get_capabilities());
+	} else {
+		uint16_t len = le16toh(header->len);
+		uint16_t offset = le16toh(header->offset);
 
 		if (!len || (len > RX_BUF_SIZE)) {
 			ESP_LOGE(TAG, "%s: bad len = %d", __func__, len);
@@ -238,33 +133,26 @@ static bool esp_shmem_hw_queue_read(void)
 			};
 			BaseType_t ret;
 
-			memcpy(copy, header, len + offset);
+			if (!copy) {
+				ESP_LOGE(TAG, "%s: malloc failed", __func__);
+			} else {
+				memcpy(copy, header, len + offset);
 
-			if (header->if_type == ESP_INTERNAL_IF)
-				ret = xQueueSend(shmem_rx_queue[PRIO_Q_HIGH], &buf_handle, portMAX_DELAY);
-			else if (header->if_type == ESP_HCI_IF)
-				ret = xQueueSend(shmem_rx_queue[PRIO_Q_MID], &buf_handle, portMAX_DELAY);
-			else
-				ret = xQueueSend(shmem_rx_queue[PRIO_Q_LOW], &buf_handle, portMAX_DELAY);
+				if (header->if_type == ESP_INTERNAL_IF)
+					ret = xQueueSend(shmem_rx_queue[PRIO_Q_HIGH], &buf_handle, portMAX_DELAY);
+				else if (header->if_type == ESP_HCI_IF)
+					ret = xQueueSend(shmem_rx_queue[PRIO_Q_MID], &buf_handle, portMAX_DELAY);
+				else
+					ret = xQueueSend(shmem_rx_queue[PRIO_Q_LOW], &buf_handle, portMAX_DELAY);
 
-			if (!ret) {
-				ESP_LOGE(TAG, "%s: xQueueSend failed", __func__);
-				free(copy);
-				break;
+				if (!ret) {
+					ESP_LOGE(TAG, "%s: xQueueSend failed", __func__);
+					free(copy);
+				} else {
+					xSemaphoreGive(read_semaphore);
+				}
 			}
-			xSemaphoreGive(read_semaphore);
 		}
-		hw_q->read = ++r;
-		ESP_LOGD(TAG, "%s: read_queue->read = %d write = %d", __func__, r, w);
-	}
-	return true;
-}
-
-static void esp_shmem_hw_queue_task(void *p)
-{
-	for (;;) {
-		if (!esp_shmem_hw_queue_read())
-			xSemaphoreTake(hw_queue_read_semaphore, portMAX_DELAY);
 	}
 }
 
@@ -311,7 +199,8 @@ esp_err_t send_bootup_event_to_host(uint8_t cap)
 	struct esp_payload_header *header = NULL;
 	struct esp_internal_bootup_event *event = NULL;
 	struct fw_data * fw_p = NULL;
-	interface_buffer_handle_t buf_handle = {0};
+	uint8_t *payload;
+	uint32_t payload_len;
 	uint8_t * pos = NULL;
 	uint16_t len = 0;
 	uint8_t raw_tp_cap = 0;
@@ -319,17 +208,17 @@ esp_err_t send_bootup_event_to_host(uint8_t cap)
 
 	ESP_LOGD(TAG, "%s", __func__);
 
-	buf_handle.payload = malloc(RX_BUF_SIZE);
-	assert(buf_handle.payload);
-	memset(buf_handle.payload, 0, RX_BUF_SIZE);
+	payload = malloc(RX_BUF_SIZE);
+	assert(payload);
+	memset(payload, 0, RX_BUF_SIZE);
 
-	header = (struct esp_payload_header *) buf_handle.payload;
+	header = (struct esp_payload_header *) payload;
 
 	header->if_type = ESP_INTERNAL_IF;
 	header->if_num = 0;
 	header->offset = htole16(sizeof(struct esp_payload_header));
 
-	event = (struct esp_internal_bootup_event*) (buf_handle.payload + sizeof(struct esp_payload_header));
+	event = (struct esp_internal_bootup_event*) (payload + sizeof(struct esp_payload_header));
 
 	event->header.event_code = ESP_INTERNAL_BOOTUP_EVENT;
 	event->header.status = 0;
@@ -367,63 +256,38 @@ esp_err_t send_bootup_event_to_host(uint8_t cap)
 
 	/* TLVs end */
 	event->len = len;
-	buf_handle.payload_len = len + sizeof(struct esp_internal_bootup_event) + sizeof(struct esp_payload_header);
+	payload_len = len + sizeof(struct esp_internal_bootup_event) + sizeof(struct esp_payload_header);
 	/*print_reset_reason(event->last_reset_reason);*/
 
 	/* payload len = Event len + sizeof(event len) */
 	len += 1;
 	event->header.len = htole16(len);
 
-	header->len = htole16(buf_handle.payload_len - sizeof(struct esp_payload_header));
+	header->len = htole16(payload_len - sizeof(struct esp_payload_header));
 
-	xQueueSend(shmem_tx_queue[PRIO_Q_HIGH], &buf_handle, portMAX_DELAY);
-
-	esp_shmem_hw_queue_write(0);
-
-	return ESP_OK;
+	return esp_ipc_tx(ESP_IPC_WIFI_ADDR, PRIO_Q_HIGH, payload);
 }
 
-static void esp_shmem_isr(void *p)
+static void esp_shmem_tx_done(void *p, void *data)
 {
-	esp_shmem_write_irq(ESP_SHMEM_IRQ_FROM_HOST_REG, 0);
-	xSemaphoreGiveFromISR(hw_queue_read_semaphore, NULL);
+	free(data);
 }
 
-static interface_handle_t * esp_shmem_init(void)
+static interface_handle_t *esp_shmem_init(void)
 {
 	int i;
 
 	ESP_LOGD(TAG, "%s", __func__);
 
-	hw_queue_read_semaphore = xSemaphoreCreateBinary();
 	read_semaphore = xSemaphoreCreateBinary();
 	for (i = 0; i < MAX_PRIORITY_QUEUES; ++i) {
-		shmem_rx_queue[i] = xQueueCreate(SPI_RX_QUEUE_SIZE, sizeof(interface_buffer_handle_t));
+		shmem_rx_queue[i] = xQueueCreate(ESP_WIFI_RX_QUEUE_SIZE,
+						 sizeof(interface_buffer_handle_t));
 		assert(shmem_rx_queue[i] != NULL);
-
-		shmem_tx_queue[i] = xQueueCreate(SPI_TX_QUEUE_SIZE, sizeof(interface_buffer_handle_t));
-		assert(shmem_tx_queue[i] != NULL);
 	}
-	shmem_tx_postprocess_queue = xQueueCreate(MAX_PRIORITY_QUEUES * SPI_TX_QUEUE_SIZE,
-						  sizeof(interface_buffer_handle_t));
-	assert(shmem_tx_postprocess_queue != NULL);
 
-	for (i = 0; i < 2; ++i) {
-		hw_queue[i].offset = (u32)(queue_data + i) - (u32)hw_queue;
-		hw_queue[i].mask = QUEUE_SIZE - 1;
-	}
-	assert(xTaskCreate(esp_shmem_hw_queue_task , "hw_queue_task" ,
-			   TASK_DEFAULT_STACK_SIZE , NULL , TASK_DEFAULT_PRIO, NULL) == pdTRUE);
-
-	intr_matrix_set(0, ETS_FROM_CPU_INTR0_SOURCE +
-			CONFIG_ESP_SHMEM_IRQ_TO_HOST_IDX, 6);
-	esp_intr_alloc(ETS_FROM_CPU_INTR0_SOURCE +
-		       CONFIG_ESP_SHMEM_IRQ_FROM_HOST_IDX,
-		       ESP_INTR_FLAG_SHARED,
-		       esp_shmem_isr, NULL, NULL);
-
-	*(volatile void **)(0x600c0004) = hw_queue;
-
+	esp_ipc_register_rx(ESP_IPC_WIFI_ADDR, NULL,
+			    esp_shmem_rx, esp_shmem_tx_done);
 	return &if_handle_g;
 }
 
