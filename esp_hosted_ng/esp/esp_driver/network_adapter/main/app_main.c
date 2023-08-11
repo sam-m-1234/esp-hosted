@@ -99,7 +99,7 @@ uint8_t ap_mac[MAC_ADDR_LEN] = {0};
 extern void wake_host();
 #endif
 
-static uint8_t get_capabilities()
+uint8_t get_capabilities(void)
 {
 	uint8_t cap = 0;
 
@@ -593,11 +593,8 @@ void app_main()
 	esp_err_t ret;
 	uint8_t prio_q_idx = 0;
 	uint8_t mac[MAC_ADDR_LEN] = {0};
-	uint8_t capa = 0;
 
 	debug_log_firmware_version();
-
-	capa = get_capabilities();
 
 	/*Initialize NVS*/
 	ret = nvs_flash_init();
@@ -661,8 +658,6 @@ void app_main()
 	while (!datapath) {
 		usleep(100*1000);
 	}
-	/*send capabilities to host*/
-	send_bootup_event_to_host(capa);
 
 	tcpip_adapter_init();
 

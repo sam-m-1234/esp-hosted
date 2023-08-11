@@ -42,6 +42,11 @@ struct esp_wifi_shmem_queue
 	u32 mask;
 };
 
+struct esp_ipc_queue_entry {
+	u32 addr;
+	void *info;
+};
+
 #define ESP_SHMEM_READ_HW_Q		1
 #define ESP_SHMEM_WRITE_HW_Q		0
 
@@ -49,7 +54,7 @@ struct esp_wifi_shmem_queue
 #define ESP_SHMEM_IRQ_TO_HOST_REG	(4 * CONFIG_ESP_SHMEM_IRQ_TO_HOST_IDX)
 
 static struct esp_wifi_shmem_queue hw_queue[2];
-static void *queue_data[2][QUEUE_SIZE];
+static struct esp_ipc_queue_entry queue_data[2][QUEUE_SIZE];
 
 static u32 tx_postprocessed;
 
@@ -76,10 +81,10 @@ static void esp_shmem_buffer_done(void *p)
 	free(p);
 }
 
-static void esp_shmem_hw_queue_write(u32 irq)
+static void esp_shmem_hw_queue_write(void)
 {
 	struct esp_wifi_shmem_queue *hw_q = hw_queue + ESP_SHMEM_WRITE_HW_Q;
-	void * volatile *data = (void *)hw_queue + hw_q->offset;
+	volatile struct esp_ipc_queue_entry *data = (void *)hw_queue + hw_q->offset;
 	bool changed = false;
 
 	for (;;) {
@@ -120,7 +125,8 @@ static void esp_shmem_hw_queue_write(u32 irq)
 			break;
 		}
 
-		data[w & hw_q->mask] = buf_handle.payload;
+		data[w & hw_q->mask].addr = 1;
+		data[w & hw_q->mask].info = buf_handle.payload;
 		hw_q->write = ++w;
 		changed = true;
 		ESP_LOGD(TAG, "%s: write_queue->write = %d", __func__, w);
@@ -133,7 +139,7 @@ static void esp_shmem_hw_queue_write(u32 irq)
 	}
 
 	if (changed)
-		esp_shmem_write_irq(ESP_SHMEM_IRQ_TO_HOST_REG, irq);
+		esp_shmem_write_irq(ESP_SHMEM_IRQ_TO_HOST_REG, 1);
 }
 
 static int32_t esp_shmem_write(interface_handle_t *handle, interface_buffer_handle_t *buf_handle)
@@ -198,7 +204,7 @@ static int32_t esp_shmem_write(interface_handle_t *handle, interface_buffer_hand
 		return ESP_FAIL;
 	}
 
-	esp_shmem_hw_queue_write(1);
+	esp_shmem_hw_queue_write();
 
 	return buf_handle->payload_len;
 }
@@ -206,7 +212,7 @@ static int32_t esp_shmem_write(interface_handle_t *handle, interface_buffer_hand
 static bool esp_shmem_hw_queue_read(void)
 {
 	struct esp_wifi_shmem_queue *hw_q = hw_queue + ESP_SHMEM_READ_HW_Q;
-	void * volatile *data = (void *)hw_queue + hw_q->offset;
+	volatile struct esp_ipc_queue_entry *data = (void *)hw_queue + hw_q->offset;
 	u32 r, w;
 
 	r = hw_q->read;
@@ -217,42 +223,54 @@ static bool esp_shmem_hw_queue_read(void)
 
 	while (r != w) {
 		struct esp_payload_header *header = NULL;
+		uint32_t addr;
 		uint16_t len = 0, offset = 0;
 
-		header = data[r & hw_q->mask];
-		len = le16toh(header->len);
-		offset = le16toh(header->offset);
+		header = data[r & hw_q->mask].info;
+		addr = data[r & hw_q->mask].addr;
 
-		if (!len || (len > RX_BUF_SIZE)) {
-			ESP_LOGE(TAG, "%s: bad len = %d", __func__, len);
+		if (addr != 1)
+			ESP_LOGE(TAG, "got IPC for an unknown address %d", addr);
+
+		if (!header) {
+			uint8_t get_capabilities(void);
+			send_bootup_event_to_host(get_capabilities());
 		} else {
-			/* Buffer is valid */
-			void *copy = malloc(len + offset);
-			interface_buffer_handle_t buf_handle = {
-				.if_type = header->if_type,
-				.if_num = header->if_num,
-				.payload = copy,
-				.payload_len = len + offset,
-				.free_buf_handle = esp_shmem_buffer_done,
-				.priv_buffer_handle = copy,
-			};
-			BaseType_t ret;
 
-			memcpy(copy, header, len + offset);
+			len = le16toh(header->len);
+			offset = le16toh(header->offset);
 
-			if (header->if_type == ESP_INTERNAL_IF)
-				ret = xQueueSend(shmem_rx_queue[PRIO_Q_HIGH], &buf_handle, portMAX_DELAY);
-			else if (header->if_type == ESP_HCI_IF)
-				ret = xQueueSend(shmem_rx_queue[PRIO_Q_MID], &buf_handle, portMAX_DELAY);
-			else
-				ret = xQueueSend(shmem_rx_queue[PRIO_Q_LOW], &buf_handle, portMAX_DELAY);
+			if (!len || (len > RX_BUF_SIZE)) {
+				ESP_LOGE(TAG, "%s: bad len = %d", __func__, len);
+			} else {
+				/* Buffer is valid */
+				void *copy = malloc(len + offset);
+				interface_buffer_handle_t buf_handle = {
+					.if_type = header->if_type,
+					.if_num = header->if_num,
+					.payload = copy,
+					.payload_len = len + offset,
+					.free_buf_handle = esp_shmem_buffer_done,
+					.priv_buffer_handle = copy,
+				};
+				BaseType_t ret;
 
-			if (!ret) {
-				ESP_LOGE(TAG, "%s: xQueueSend failed", __func__);
-				free(copy);
-				break;
+				memcpy(copy, header, len + offset);
+
+				if (header->if_type == ESP_INTERNAL_IF)
+					ret = xQueueSend(shmem_rx_queue[PRIO_Q_HIGH], &buf_handle, portMAX_DELAY);
+				else if (header->if_type == ESP_HCI_IF)
+					ret = xQueueSend(shmem_rx_queue[PRIO_Q_MID], &buf_handle, portMAX_DELAY);
+				else
+					ret = xQueueSend(shmem_rx_queue[PRIO_Q_LOW], &buf_handle, portMAX_DELAY);
+
+				if (!ret) {
+					ESP_LOGE(TAG, "%s: xQueueSend failed", __func__);
+					free(copy);
+					break;
+				}
+				xSemaphoreGive(read_semaphore);
 			}
-			xSemaphoreGive(read_semaphore);
 		}
 		hw_q->read = ++r;
 		ESP_LOGD(TAG, "%s: read_queue->read = %d write = %d", __func__, r, w);
@@ -378,7 +396,7 @@ esp_err_t send_bootup_event_to_host(uint8_t cap)
 
 	xQueueSend(shmem_tx_queue[PRIO_Q_HIGH], &buf_handle, portMAX_DELAY);
 
-	esp_shmem_hw_queue_write(0);
+	esp_shmem_hw_queue_write();
 
 	return ESP_OK;
 }
