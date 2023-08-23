@@ -599,6 +599,9 @@ void app_main()
 	ret = esp_ipc_init();
 	ESP_ERROR_CHECK(ret);
 
+	void esp_linux_flash_init(void);
+	esp_linux_flash_init();
+
 	debug_log_firmware_version();
 
 	/*Initialize NVS*/
