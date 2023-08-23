@@ -60,13 +60,16 @@ static void IRAM_ATTR map_flash_and_go(void)
 {
 	const void *ptr0, *ptr;
 
-	map_partition_part("factory", 0x90000);
+	map_partition_part("factory", 0x40000);
+
+	ptr = map_partition("etc");
+	printf("etc ptr = %p\n", ptr);
 
 	ptr0 = map_partition("linux");
-	printf("ptr = %p\n", ptr0);
+	printf("linux ptr = %p\n", ptr0);
 
 	ptr = map_partition("rootfs");
-	printf("ptr = %p\n", ptr);
+	printf("rootfs ptr = %p\n", ptr);
 
 	map_psram_to_iram();
 
