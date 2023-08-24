@@ -13,7 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-static const void * IRAM_ATTR map_partition(const char *name)
+static const void * IRAM_ATTR map_partition_part(const char *name, uint32_t size)
 {
 	const void *ptr;
 	spi_flash_mmap_handle_t handle;
@@ -22,9 +22,15 @@ static const void * IRAM_ATTR map_partition(const char *name)
 
 	it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, name);
 	part = esp_partition_get(it);
-	if (esp_partition_mmap(part, 0, part->size, SPI_FLASH_MMAP_INST, &ptr, &handle) != ESP_OK)
+	if (esp_partition_mmap(part, 0, size ? size : part->size,
+			       SPI_FLASH_MMAP_INST, &ptr, &handle) != ESP_OK)
 		abort();
 	return ptr;
+}
+
+static const void * IRAM_ATTR map_partition(const char *name)
+{
+	return map_partition_part(name, 0);
 }
 
 static void cache_partition(const char *name)
@@ -53,6 +59,8 @@ static void map_psram_to_iram(void)
 static void IRAM_ATTR map_flash_and_go(void)
 {
 	const void *ptr0, *ptr;
+
+	map_partition_part("factory", 0x90000);
 
 	ptr0 = map_partition("linux");
 	printf("ptr = %p\n", ptr0);
