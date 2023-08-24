@@ -68,6 +68,8 @@ static void IRAM_ATTR map_flash_and_go(void)
 	g_abort_on_ipc = 1;
 
 	asm volatile ("jx %0" :: "r"(ptr0));
+	/* space for the kernel vectors */
+	asm volatile (".space 8192");
 }
 
 static void linux_task(void *p)
