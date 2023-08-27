@@ -18,14 +18,21 @@ enum {
 	ESP32_IPC_FLASH_STATE_DONE,
 };
 
+enum {
+	ESP_IPC_FLASH_CMD_ERASE,
+	ESP_IPC_FLASH_CMD_READ,
+	ESP_IPC_FLASH_CMD_WRITE,
+};
+
 struct esp32_ipc_flash_cmd {
-	const void *data;
+	void *data;
 	uint32_t addr;
 	uint32_t size;
 	uint32_t remote_state;
 
 	uint32_t local_state;
 	uint32_t result;
+	uint32_t code;
 };
 
 extern int g_spi_flash_skip_ipc;
@@ -44,10 +51,22 @@ static void esp_flash_rx(void *p, void *data)
 			asm volatile ("memw" ::: "memory");
 		}
 		g_spi_flash_skip_ipc = 1;
-		if (cmd->data) {
-			ret = esp_flash_write(NULL, cmd->data, cmd->addr, cmd->size);
-		} else {
+		switch (cmd->code) {
+		case ESP_IPC_FLASH_CMD_ERASE:
 			ret = esp_flash_erase_region(NULL, cmd->addr, cmd->size);
+			break;
+
+		case ESP_IPC_FLASH_CMD_READ:
+			ret = esp_flash_read_encrypted(NULL, cmd->addr, cmd->data, cmd->size);
+			break;
+
+		case ESP_IPC_FLASH_CMD_WRITE:
+			ret = esp_flash_write(NULL, cmd->data, cmd->addr, cmd->size);
+			break;
+
+		default:
+			ret = ESP_FAIL;
+			break;
 		}
 		g_spi_flash_skip_ipc = 0;
 		cmd->result = (ret == ESP_OK) ? 0 : 1;
